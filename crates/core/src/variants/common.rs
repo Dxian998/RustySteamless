@@ -38,16 +38,22 @@ pub(crate) fn remove_bind_section(pe: &mut PeFile, options: &Options) -> Result<
         return Ok(false);
     }
 
-    let bind = pe
-        .get_section(".bind")
-        .ok_or_else(|| Error::Unpack(".bind section not found".into()))?;
-    if !bind.is_valid() {
-        return Err(Error::Unpack(".bind section is invalid".into()));
-    }
+    let (bind_rva, bind_size, index) = {
+        let bind = pe
+            .get_section(".bind")
+            .ok_or_else(|| Error::Unpack(".bind section not found".into()))?;
+        if !bind.is_valid() {
+            return Err(Error::Unpack(".bind section is invalid".into()));
+        }
+        let index = pe
+            .section_index_of(bind)
+            .ok_or_else(|| Error::Unpack(".bind section not found".into()))?;
+        (bind.virtual_address, bind.virtual_size, index)
+    };
 
-    let index = pe
-        .section_index_of(bind)
-        .ok_or_else(|| Error::Unpack(".bind section not found".into()))?;
+    pe.removed_bind_rva = Some(bind_rva);
+    pe.removed_bind_size = Some(bind_size);
+
     pe.remove_section(index);
     pe.file_header.number_of_sections = pe.file_header.number_of_sections.saturating_sub(1);
     Ok(true)

@@ -196,11 +196,19 @@ impl Variant20 {
     fn step2(&self, pe: &mut PeFile, options: &Options, header: &Header) -> Result<usize> {
         // Determine the code section RVA.
         let mut code_section_rva = pe.optional.base_of_code as u64;
+        let owner = pe.get_owner_section(code_section_rva);
+        let is_invalid =
+            owner.is_none_or(|s| s.pointer_to_raw_data == 0 || s.size_of_raw_data == 0);
 
-        // This is not really ideal to do but this breaks support for other
-        // variants of this version when disabled (mirrors the C# TODO).
-        if options.use_experimental_features && header.code_section_va != 0 {
-            code_section_rva = pe.get_rva_from_va(header.code_section_va as u64);
+        // Some variants report a wrong BaseOfCode. Fall back to the stub header's code section address
+        // when the default does not map to a valid section (or when experimental features are explicitly on).
+        if (is_invalid || options.use_experimental_features) && header.code_section_va != 0 {
+            let stub_rva = pe.get_rva_from_va(header.code_section_va as u64);
+            if let Some(stub_owner) = pe.get_owner_section(stub_rva) {
+                if stub_owner.pointer_to_raw_data != 0 && stub_owner.size_of_raw_data != 0 {
+                    code_section_rva = stub_rva;
+                }
+            }
         }
 
         // Get the code section.

@@ -26,8 +26,8 @@ const OFFSET_BLOCK_SIZE: usize = 1024;
 
 /// Known SteamDRMP.dll offset detection patterns (try order: 1, then 2, then 3).
 const DRMP_PATTERNS: [&str; 3] = [
-    // Primary pattern..
-    "8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8D ?? ?? ?? ?? ?? 05",
+    // Primary pattern (5 mov pairs before lea)..
+    "8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8D ?? ?? ?? ?? ?? 05",
     // Fall-back pattern (1)..
     "8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B ?? ?? ?? ?? ?? 89 ?? ?? ?? ?? ?? 8B",
     // Fall-back pattern (2).. (Seen in some v2 variants.)
@@ -80,7 +80,7 @@ impl crate::variants::Unpacker for Variant21 {
             Level::Info,
             "Step 4 - Scan, dump and pull needed offsets from within the SteamDRMP.dll file.",
         );
-        let offsets = self.step4(&steam_drmp, options)?;
+        let offsets = self.step4(&steam_drmp, &payload, logger)?;
 
         logger.log(
             Level::Info,
@@ -250,36 +250,54 @@ impl Variant21 {
     }
 
     /// Step 4: scan, dump and pull needed offsets from within the SteamDRMP.dll file.
-    fn step4(&self, steam_drmp: &[u8], options: &Options) -> Result<Vec<i32>> {
-        // Scan for the needed data by a known pattern for the block of offset data..
-        let mut use_fallback = false;
-        let mut drmp_offset = None;
-        for (i, pat) in DRMP_PATTERNS.iter().enumerate() {
-            if let Ok(off) = crate::pattern::find_pattern(steam_drmp, pat) {
-                use_fallback = i == 2;
-                drmp_offset = Some(off);
-                break;
+    fn step4(&self, steam_drmp: &[u8], payload: &[u8], logger: &dyn Logger) -> Result<Vec<i32>> {
+        for pat in DRMP_PATTERNS {
+            let drmp_offset = match crate::pattern::find_pattern(steam_drmp, pat) {
+                Ok(off) => off,
+                Err(_) => continue,
+            };
+
+            let block_end = (drmp_offset + OFFSET_BLOCK_SIZE).min(steam_drmp.len());
+            if block_end.saturating_sub(drmp_offset) < 76 {
+                continue;
             }
+            let block = &steam_drmp[drmp_offset..block_end];
+
+            // 1. Try known hardcoded offsets (both standard and fallback)
+            for use_fallback in [false, true] {
+                if let Some(offsets) = get_drmp_offsets(block, use_fallback) {
+                    if validate_steam_drmp_offsets(&offsets, payload) {
+                        return Ok(offsets);
+                    }
+                }
+            }
+
+            // 2. Try dynamic disassembly
+            let dyn_offsets = get_drmp_offsets_dynamic(block);
+            if validate_steam_drmp_offsets(&dyn_offsets, payload) {
+                logger.log(Level::Debug, " --> Using dynamic offset extraction.");
+                return Ok(dyn_offsets);
+            }
+
+            // 3. Try scanning for correct layout in DRMP data block
+            logger.log(
+                Level::Debug,
+                " --> Scanning for correct offset layout in DRMP data block...",
+            );
+            if let Some(found) = scan_steam_drmp_offsets(steam_drmp, drmp_offset, payload, logger) {
+                logger.log(Level::Debug, " --> Found valid offsets via scan.");
+                return Ok(found);
+            }
+
+            logger.log(
+                Level::Debug,
+                " --> Pattern matched but could not find valid offsets, trying next pattern.",
+            );
         }
-        let drmp_offset = drmp_offset.ok_or(Error::PatternNotFound)?;
 
-        // Copy the block of data from the SteamDRMP.dll data..
-        let block_end = (drmp_offset + OFFSET_BLOCK_SIZE).min(steam_drmp.len());
-        let block = &steam_drmp[drmp_offset..block_end];
-
-        // Obtain the offsets from the file data..
-        let offsets = if options.use_experimental_features {
-            get_drmp_offsets_dynamic(block)
-        } else {
-            get_drmp_offsets(block, use_fallback)
-        };
-        if offsets.len() != 8 {
-            return Err(Error::Unpack(
-                "failed to extract the SteamDRMP.dll offsets".into(),
-            ));
-        }
-
-        Ok(offsets)
+        Err(Error::Unpack(
+            "failed to extract the SteamDRMP.dll offsets".into(),
+        ))
     }
 
     /// Step 5: read, decrypt and process the main code section.
@@ -303,17 +321,39 @@ impl Variant21 {
         }
 
         // Obtain the main code section (typically .text)..
-        let code_section_va = payload_u32(payload, offsets[3] as u32);
-        let main_rva = pe.get_rva_from_va(code_section_va as u64);
-        let main_section = pe
-            .get_owner_section(main_rva)
-            .ok_or_else(|| Error::Unpack("main code section not found".into()))?;
+        let mut main_section = None;
 
-        if offsets[3] != 0
-            && (main_section.pointer_to_raw_data == 0 || main_section.size_of_raw_data == 0)
-        {
-            return Err(Error::Unpack("main code section is invalid".into()));
+        if offsets[3] != 0 {
+            let code_section_va = payload_u32(payload, offsets[3] as u32);
+            let main_rva = pe.get_rva_from_va(code_section_va as u64);
+            if let Some(sec) = pe.get_owner_section(main_rva) {
+                if sec.pointer_to_raw_data != 0 && sec.size_of_raw_data != 0 {
+                    main_section = Some(*sec);
+                }
+            }
         }
+
+        if main_section.is_none() {
+            // Fallback: the code section VA offset is 0 (some SteamDRMP variants
+            // do not store this field). Use the OEP to locate the code section
+            // since the original entry point always resides inside it.
+            let oep_va = payload_u32(payload, offsets[2] as u32);
+            let oep_rva = pe.get_rva_from_va(oep_va as u64);
+            let sec = pe
+                .get_owner_section(oep_rva)
+                .ok_or_else(|| Error::Unpack("main code section not found via OEP".into()))?;
+            if sec.pointer_to_raw_data == 0 || sec.size_of_raw_data == 0 {
+                return Err(Error::Unpack("main code section is invalid".into()));
+            }
+
+            logger.log(
+                Level::Debug,
+                &format!(" --> Code section VA offset was 0; resolved via OEP 0x{oep_va:08X}."),
+            );
+            main_section = Some(*sec);
+        }
+
+        let main_section = main_section.unwrap();
 
         logger.log(
             Level::Debug,
@@ -325,10 +365,9 @@ impl Variant21 {
 
         // Save the code section index for later use..
         let code_index = pe
-            .section_index_of(main_section)
+            .section_index_of(&main_section)
             .ok_or_else(|| Error::Unpack("main code section not found".into()))?;
 
-        let mut encrypted_size = 0u32;
         let section_offset = pe.get_file_offset_from_rva(main_section.virtual_address as u64);
 
         // Determine if we are using encryption on the section..
@@ -352,7 +391,7 @@ impl Variant21 {
                 let aes_key = payload_get(payload, offsets[5] as u32, 32)?;
                 let aes_iv = payload_get(payload, offsets[6] as u32, 16)?;
                 let code_stolen = payload_get(payload, offsets[7] as u32, 16)?;
-                encrypted_size = payload_u32(payload, offsets[4] as u32);
+                let encrypted_size = payload_u32(payload, offsets[4] as u32);
 
                 // Restore the stolen data then read the rest of the section data..
                 let mut merged = code_stolen.to_vec();
@@ -370,9 +409,7 @@ impl Variant21 {
 
         // Merge the code section data..
         let section_data_len = pe.section_data[code_index].len();
-        let copy_len = (encrypted_size as usize)
-            .min(code_section_data.len())
-            .min(section_data_len);
+        let copy_len = code_section_data.len().min(section_data_len);
         let mut merged_section = pe.section_data[code_index].clone();
         merged_section[..copy_len].copy_from_slice(&code_section_data[..copy_len]);
         pe.section_data[code_index] = merged_section;
@@ -397,9 +434,122 @@ fn payload_u32(data: &[u8], offset: u32) -> u32 {
     )
 }
 
+// Reads a little-endian i32 from `data` at `off`.
+fn rd_i32(data: &[u8], off: usize) -> Option<i32> {
+    data.get(off..off + 4)
+        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+// Validates whether extracted offsets are safely within payload bounds and satisfy
+// DRM header layout constraints.
+fn validate_steam_drmp_offsets(offsets: &[i32], payload: &[u8]) -> bool {
+    if offsets.len() != 8 {
+        return false;
+    }
+
+    let payload_len = payload.len();
+    let check_bound = |val: i32, size: usize| -> bool {
+        if val < 0 {
+            return false;
+        }
+        (val as usize)
+            .checked_add(size)
+            .is_some_and(|end| end <= payload_len)
+    };
+
+    // Always validate flags, OEP and code section virtual address offsets.
+    if !check_bound(offsets[0], 4) || !check_bound(offsets[2], 4) || !check_bound(offsets[3], 4) {
+        return false;
+    }
+
+    let flags = payload_u32(payload, offsets[0] as u32);
+    if (flags & common::DRM_FLAG_NO_ENCRYPTION) != common::DRM_FLAG_NO_ENCRYPTION {
+        // Encrypted: validate encryption offsets.
+        if !check_bound(offsets[4], 4)
+            || !check_bound(offsets[5], 32)
+            || !check_bound(offsets[6], 16)
+            || !check_bound(offsets[7], 16)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+// Exhaustive sliding window scan of the offset data block to locate valid DRM offsets
+// when hardcoded and dynamic disassembly both miss (mirrors Steamless-KR `ScanSteamDrmpOffsets`).
+fn scan_steam_drmp_offsets(
+    steam_drmp: &[u8],
+    scan_offset: usize,
+    payload: &[u8],
+    logger: &dyn Logger,
+) -> Option<Vec<i32>> {
+    let copy_size = 1024.min(steam_drmp.len().saturating_sub(scan_offset));
+    if copy_size < 28 {
+        return None;
+    }
+    let data = &steam_drmp[scan_offset..scan_offset + copy_size];
+    let payload_limit = payload.len();
+
+    let check_bound = |val: i32, size: usize| -> bool {
+        if val < 0 {
+            return false;
+        }
+        (val as usize)
+            .checked_add(size)
+            .is_some_and(|end| end <= payload_limit)
+    };
+
+    for start in (0..data.len().saturating_sub(28)).step_by(2) {
+        let mut vals = Vec::with_capacity(8);
+        for j in 0..6 {
+            vals.push(rd_i32(data, start + j * 4)?);
+        }
+        let iv_offset = rd_i32(data, start + 6 * 4)?;
+        vals.push(iv_offset);
+        vals.push(iv_offset.checked_add(16)?);
+
+        if !check_bound(vals[0], 4) {
+            continue;
+        }
+
+        let flags = payload_u32(payload, vals[0] as u32);
+        let no_enc = (flags & common::DRM_FLAG_NO_ENCRYPTION) == common::DRM_FLAG_NO_ENCRYPTION;
+
+        if !check_bound(vals[3], 4) {
+            continue;
+        }
+
+        if !no_enc {
+            if !check_bound(vals[4], 4)
+                || !check_bound(vals[5], 32)
+                || !check_bound(vals[6], 16)
+                || !check_bound(vals[7], 16)
+            {
+                continue;
+            }
+            if vals[5].checked_add(32)? > vals[6] {
+                continue;
+            }
+            if vals[6].checked_add(16)? != vals[7] {
+                continue;
+            }
+        }
+
+        logger.log(
+            Level::Debug,
+            &format!(" --> Found valid offset layout at byte offset {start} in data block!"),
+        );
+        return Some(vals);
+    }
+
+    None
+}
+
 /// Extracts the SteamDRMP.dll offsets using the fixed positions in the offset
 /// block (mirrors `GetSteamDrmpOffsets`).
-fn get_drmp_offsets(data: &[u8], fallback: bool) -> Vec<i32> {
+fn get_drmp_offsets(data: &[u8], fallback: bool) -> Option<Vec<i32>> {
     let offset0 = 2; // Flags
     let offset1 = 14; // Steam App Id
     let offset2 = if fallback { 25 } else { 26 }; // OEP
@@ -408,20 +558,17 @@ fn get_drmp_offsets(data: &[u8], fallback: bool) -> Vec<i32> {
     let offset5 = if fallback { 61 } else { 62 }; // Code Section AES Key
     let offset6 = if fallback { 72 } else { 67 }; // Code Section AES Iv
 
-    let mut offsets = vec![
-        i32::from_le_bytes(data[offset0..offset0 + 4].try_into().unwrap()), // 0 - Flags
-        i32::from_le_bytes(data[offset1..offset1 + 4].try_into().unwrap()), // 1 - Steam App Id
-        i32::from_le_bytes(data[offset2..offset2 + 4].try_into().unwrap()), // 2 - OEP
-        i32::from_le_bytes(data[offset3..offset3 + 4].try_into().unwrap()), // 3 - Code Section Virtual Address
-        i32::from_le_bytes(data[offset4..offset4 + 4].try_into().unwrap()), // 4 - Code Section Virtual Size (Encrypted Size)
-        i32::from_le_bytes(data[offset5..offset5 + 4].try_into().unwrap()), // 5 - Code Section AES Key
-    ];
-
-    let aes_iv_offset = i32::from_le_bytes(data[offset6..offset6 + 4].try_into().unwrap());
-    offsets.push(aes_iv_offset); // 6 - Code Section AES Iv
-    offsets.push(aes_iv_offset + 16); // 7 - Code Section Stolen Bytes
-
-    offsets
+    let aes_iv_offset = rd_i32(data, offset6)?;
+    Some(vec![
+        rd_i32(data, offset0)?,
+        rd_i32(data, offset1)?,
+        rd_i32(data, offset2)?,
+        rd_i32(data, offset3)?,
+        rd_i32(data, offset4)?,
+        rd_i32(data, offset5)?,
+        aes_iv_offset,
+        aes_iv_offset.checked_add(16)?,
+    ])
 }
 
 /// Extracts the SteamDRMP.dll offsets dynamically by disassembling the offset
@@ -494,7 +641,7 @@ mod tests {
         data[62..66].fill(0xAB);
         data[67..71].copy_from_slice(&0x100u32.to_le_bytes());
 
-        let offsets = get_drmp_offsets(&data, false);
+        let offsets = get_drmp_offsets(&data, false).unwrap();
         assert_eq!(offsets.len(), 8);
         assert_eq!(offsets[0], 1);
         assert_eq!(offsets[1], 730);
@@ -504,5 +651,32 @@ mod tests {
         assert_eq!(offsets[5], i32::from_le_bytes([0xAB, 0xAB, 0xAB, 0xAB]));
         assert_eq!(offsets[6], 0x100);
         assert_eq!(offsets[7], 0x110);
+    }
+
+    #[test]
+    fn validate_and_scan_drmp_offsets() {
+        let payload = vec![0u8; 0x1000];
+        let valid_offsets = vec![2, 14, 26, 38, 50, 0x100, 0x200, 0x210];
+        assert!(validate_steam_drmp_offsets(&valid_offsets, &payload));
+
+        // Invalid: key offset past payload length
+        let invalid_offsets = vec![2, 14, 26, 38, 50, 0x1000, 0x200, 0x210];
+        assert!(!validate_steam_drmp_offsets(&invalid_offsets, &payload));
+
+        // Test scanning fallback when primary block is shifted
+        let mut data = vec![0xFFu8; 2048];
+        let shift = 256;
+        let test_offsets: [i32; 7] = [10, 20, 30, 40, 50, 100, 200];
+        for (i, &val) in test_offsets.iter().enumerate() {
+            data[shift + i * 4..shift + (i + 1) * 4].copy_from_slice(&val.to_le_bytes());
+        }
+
+        let logger = crate::logger::NullLogger;
+        let scanned = scan_steam_drmp_offsets(&data, 0, &payload, &logger).unwrap();
+        assert_eq!(scanned.len(), 8);
+        assert_eq!(scanned[0], 10);
+        assert_eq!(scanned[1], 20);
+        assert_eq!(scanned[6], 200);
+        assert_eq!(scanned[7], 216);
     }
 }

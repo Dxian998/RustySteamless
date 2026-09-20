@@ -71,8 +71,10 @@ const X86_V31_HEADER_SIZE_8D: &str =
     "55 8B EC 81 EC ?? ?? ?? ?? 56 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 8D";
 /// v3.1.2 x64 header size pattern.
 const X64_V31_HEADER_SIZE_C7: &str = "48 C7 84 24 ?? ?? ?? ?? ?? ?? ?? ?? 48";
-/// Pattern used to recover the true OEP when the TLS callback hides it (v3.0 x64).
-const TLS_OEP_KEY_PATTERN: &str = "48 81 EA ?? ?? ?? ?? 8B 12 81 F2";
+/// Pattern used to recover the true OEP when the TLS callback hides it (x64).
+const X64_TLS_OEP_KEY_PATTERN: &str = "48 81 EA ?? ?? ?? ?? 8B 12 81 F2";
+/// Pattern used to recover the true OEP when the TLS callback hides it (x86).
+const X86_TLS_OEP_KEY_PATTERN: &str = "81 EA ?? ?? ?? ?? 8B 12 81 F2";
 
 /// Reads a little-endian i32 as-is (C# `BitConverter.ToInt32`).
 fn rd_i32(data: &[u8], off: usize) -> Option<i32> {
@@ -263,64 +265,99 @@ pub(crate) fn step1(pe: &mut PeFile, variant: Variant, is64: bool) -> Result<Sta
         Variant::V31 => 0xC0DEC0DF,
     };
 
-    let (_, xor_key, header) = read_header(
-        pe,
-        pe.get_file_offset_from_rva(pe.optional.address_of_entry_point as u64),
-    )?;
-    if header.signature == expected {
-        return Ok(State {
-            header,
-            xor_key,
-            tls_as_oep: false,
-            tls_oep_rva: 0,
-            tls_oep_override: 0,
-            code_index: None,
-            code_section_data: None,
-        });
+    // Attempt 1: read header from AddressOfEntryPoint - header_size
+    let ep_off = pe.get_file_offset_from_rva(pe.optional.address_of_entry_point as u64);
+    if let Ok((_, xor_key, header)) = read_header(pe, ep_off) {
+        if header.signature == expected {
+            return Ok(State {
+                header,
+                xor_key,
+                tls_as_oep: false,
+                tls_oep_rva: 0,
+                tls_oep_override: 0,
+                code_index: None,
+                code_section_data: None,
+            });
+        }
     }
 
-    // Try again using the TLS callback (if any) as the OEP instead..
-    let first_callback =
-        pe.tls_callbacks.first().copied().ok_or_else(|| {
-            Error::Unpack("header signature mismatch and no TLS callbacks".into())
-        })?;
+    // Attempt 2: read header from first TLS callback - header_size
+    if let Some(&first_callback) = pe.tls_callbacks.first() {
+        let tls_file_off = pe.get_file_offset_from_rva(pe.get_rva_from_va(first_callback));
+        if let Ok((_, xor_key, header)) = read_header(pe, tls_file_off) {
+            let matches_sig = header.signature == expected;
+            if matches_sig {
+                let tls_oep_rva = pe.get_rva_from_va(first_callback);
+                let mut tls_oep_override = 0u32;
 
-    let (_, xor_key, header) = read_header(
-        pe,
-        pe.get_file_offset_from_rva(pe.get_rva_from_va(first_callback)),
-    )?;
+                // When TLS callback replaces the OEP, rebuild it.
+                let should_rebuild = match variant {
+                    Variant::V30 => header.has_tls_callback == 1 && first_callback != 0,
+                    Variant::V31 => first_callback != 0,
+                };
+                if should_rebuild {
+                    if let Ok(override_oep) = rebuild_tls_callback_information(pe, &header, is64) {
+                        tls_oep_override = override_oep;
+                    }
+                }
 
-    // The v3.1 (and v3.0 x64) TLS paths require a matching signature; the
-    // original v3.0 x86 plugin accepts the TLS location unconditionally.
-    if (variant == Variant::V31 || is64) && header.signature != expected {
-        return Err(Error::Unpack("header signature mismatch".into()));
+                return Ok(State {
+                    header,
+                    xor_key,
+                    tls_as_oep: true,
+                    tls_oep_rva,
+                    tls_oep_override,
+                    code_index: None,
+                    code_section_data: None,
+                });
+            }
+        }
     }
 
-    let tls_oep_rva = pe.get_rva_from_va(first_callback);
-    let mut tls_oep_override = 0u32;
-
-    // v3.0 x64 only: when the TLS callback replaces the OEP, rebuild it.
-    if variant == Variant::V30 && is64 && header.has_tls_callback == 1 && first_callback != 0 {
-        tls_oep_override = rebuild_tls_callback_information(pe, &header)?;
+    // Attempt 3: scan .bind section for header signature.
+    // Some packed files have a PE entry point that does not point into the .bind section,
+    // so the header is not at EP - header_size.
+    if let Some(bind_data) = pe.get_section_data_by_name(".bind") {
+        let h_size = header_size as usize;
+        if bind_data.len() >= h_size {
+            for offset in (0..=bind_data.len() - h_size).step_by(4) {
+                let mut chunk = bind_data[offset..offset + h_size].to_vec();
+                let xor_key = steam_xor(&mut chunk, header_size, 0);
+                if let Ok(header) = parse_header(&chunk, variant) {
+                    if header.signature == expected {
+                        return Ok(State {
+                            header,
+                            xor_key,
+                            tls_as_oep: false,
+                            tls_oep_rva: 0,
+                            tls_oep_override: 0,
+                            code_index: None,
+                            code_section_data: None,
+                        });
+                    }
+                }
+            }
+        }
     }
 
-    Ok(State {
-        header,
-        xor_key,
-        tls_as_oep: true,
-        tls_oep_rva,
-        tls_oep_override,
-        code_index: None,
-        code_section_data: None,
-    })
+    Err(Error::Unpack("header signature mismatch".into()))
 }
 
 /// Rebuilds the file TLS callback information and repairs the proper OEP
-/// (v3.0 x64 `RebuildTlsCallbackInformation`).
-fn rebuild_tls_callback_information(pe: &mut PeFile, header: &Var3xHeader) -> Result<u32> {
+/// (v3.0 / v3.1 `RebuildTlsCallbackInformation`).
+fn rebuild_tls_callback_information(
+    pe: &mut PeFile,
+    header: &Var3xHeader,
+    is64: bool,
+) -> Result<u32> {
     // Ensure the modified main TLS callback is within the .bind section..
+    let first_callback = pe
+        .tls_callbacks
+        .first()
+        .copied()
+        .ok_or_else(|| Error::Unpack("missing TLS callback".into()))?;
     let section = pe
-        .get_owner_section(pe.get_rva_from_va(pe.tls_callbacks[0]))
+        .get_owner_section(pe.get_rva_from_va(first_callback))
         .ok_or_else(|| Error::Unpack("TLS callback outside of any section".into()))?;
     if !section.is_valid() || !section.name_str().eq_ignore_ascii_case(".bind") {
         return Err(Error::Unpack(
@@ -332,9 +369,10 @@ fn rebuild_tls_callback_information(pe: &mut PeFile, header: &Var3xHeader) -> Re
     let tlsd = pe
         .tls_directory
         .ok_or_else(|| Error::Unpack("missing TLS directory".into()))?;
-    let mut addr = pe.get_file_offset_from_rva(pe.get_rva_from_va(tlsd.address_of_callbacks));
+    let callback_rva = pe.get_rva_from_va(tlsd.address_of_callbacks);
+    let mut addr = pe.get_file_offset_from_rva(callback_rva);
     let tlsd_section = pe
-        .get_owner_section(addr)
+        .get_owner_section(callback_rva)
         .ok_or_else(|| Error::Unpack("TLS directory outside of any section".into()))?;
     if !tlsd_section.is_valid() {
         return Err(Error::Unpack("TLS directory section is invalid".into()));
@@ -345,11 +383,20 @@ fn rebuild_tls_callback_information(pe: &mut PeFile, header: &Var3xHeader) -> Re
         .section_index_of(tlsd_section)
         .ok_or_else(|| Error::Unpack("TLS directory section not found".into()))?;
 
-    // Restore the true original TLS callback address (8 bytes for x64)..
-    let callback = (pe.optional.image_base + header.original_entry_point as u64).to_le_bytes();
+    // Restore the true original TLS callback address: 8 bytes for x64, 4 bytes for x86.
+    let callback_bytes: Vec<u8> = if is64 {
+        (pe.optional.image_base + header.original_entry_point as u64)
+            .to_le_bytes()
+            .to_vec()
+    } else {
+        ((pe.optional.image_base as u32).wrapping_add(header.original_entry_point))
+            .to_le_bytes()
+            .to_vec()
+    };
+
     let start = addr as usize;
     let end = start
-        .checked_add(callback.len())
+        .checked_add(callback_bytes.len())
         .ok_or(Error::OutOfBounds)?;
     let section_data = pe
         .section_data
@@ -358,7 +405,7 @@ fn rebuild_tls_callback_information(pe: &mut PeFile, header: &Var3xHeader) -> Re
     if end > section_data.len() {
         return Err(Error::OutOfBounds);
     }
-    section_data[start..end].copy_from_slice(&callback);
+    section_data[start..end].copy_from_slice(&callback_bytes);
 
     // Find the original entry point function..
     let entry = pe.get_file_offset_from_rva(pe.optional.address_of_entry_point as u64);
@@ -370,15 +417,21 @@ fn rebuild_tls_callback_information(pe: &mut PeFile, header: &Var3xHeader) -> Re
         .ok_or(Error::OutOfBounds)?;
 
     // Find the XOR key from within the function..
-    let res = crate::pattern::find_pattern(data, TLS_OEP_KEY_PATTERN)?;
+    let (pat, val_off) = if is64 {
+        (X64_TLS_OEP_KEY_PATTERN, 0x0B)
+    } else {
+        (X86_TLS_OEP_KEY_PATTERN, 0x0A)
+    };
 
-    // Decrypt and recalculate the true OEP address..
+    let res = crate::pattern::find_pattern(data, pat)?;
+
     let intv = i32::from_le_bytes(
-        data.get(res + 0x0B..res + 0x0F)
+        data.get(res + val_off..res + val_off + 4)
             .ok_or(Error::OutOfBounds)?
             .try_into()
             .map_err(|_| Error::OutOfBounds)?,
     );
+
     let key = ((header.xor_key as u64 as i64) ^ (intv as i64)) as u64;
     let off = pe
         .optional
@@ -386,7 +439,7 @@ fn rebuild_tls_callback_information(pe: &mut PeFile, header: &Var3xHeader) -> Re
         .wrapping_add(pe.optional.address_of_entry_point as u64)
         .wrapping_add(key);
 
-    Ok((off - pe.optional.image_base) as u32)
+    Ok(off.wrapping_sub(pe.optional.image_base) as u32)
 }
 
 /// Step 2 - Read, decode and process the payload data.
@@ -574,10 +627,10 @@ pub(crate) fn step6(
     pe: &mut PeFile,
     options: &Options,
     state: &State,
-    variant: Variant,
-    is64: bool,
+    _variant: Variant,
+    _is64: bool,
 ) -> Result<std::path::PathBuf> {
-    let entry_point = if variant == Variant::V30 && is64 && state.header.has_tls_callback == 1 {
+    let entry_point = if state.tls_oep_override > 0 {
         state.tls_oep_override
     } else {
         state.header.original_entry_point
@@ -641,5 +694,65 @@ mod tests {
         assert!(is_v30_size(0xB0));
         assert!(is_v30_size(0xD0));
         assert!(!is_v30_size(0xF0));
+    }
+
+    #[test]
+    fn scan_bind_section_fallback_finds_header() {
+        let raw_hdr = build_v30_header();
+        // Obfuscate with steam_xor using key 0 so decoding with steam_xor(..., 0) recovers it
+        let mut enc_hdr = raw_hdr.clone();
+        let mut key = u32::from_le_bytes(enc_hdr[0..4].try_into().unwrap());
+        for chunk in enc_hdr[4..].chunks_exact_mut(4) {
+            let p = u32::from_le_bytes(chunk.try_into().unwrap());
+            let c = p ^ key;
+            chunk.copy_from_slice(&c.to_le_bytes());
+            key = c;
+        }
+
+        // Include X86_VARIANT and X86_V30_HEADER_SIZE_PATTERN so read_header_size succeeds with 0xD0
+        // Total bytes before header must be a multiple of 4.
+        let mut bind_bytes = vec![
+            0xE8, 0x00, 0x00, 0x00, 0x00, 0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x55, 0x8B, 0x44,
+            0x24, 0x1C, 0x2D, 0x05, 0x00, 0x00, 0x00, 0x8B, 0xCC, 0x83, 0xE4, 0xF0, 0x51, 0x51,
+            0x51, 0x50, 0x90, 0x90, // 32 bytes so far
+            0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00, 0x53, 0x90, 0x90, 0x90, 0x90,
+            0x90, 0x68, 0xD0, 0x00, 0x00, 0x00, // 32 + 20 = 52 bytes (multiple of 4)
+        ];
+        // Put padding and then the header (at an offset not matching EP - header_size)
+        bind_bytes.extend_from_slice(&[0x90; 64]);
+        bind_bytes.extend_from_slice(&enc_hdr);
+        bind_bytes.extend_from_slice(&[0x90; 64]);
+
+        let bind_size = bind_bytes.len() as u32;
+        let bind_raw = 0x400u32;
+        let bind_rva = 0x2000u32;
+
+        let mut file = vec![0u8; 0x1000];
+        file[0] = b'M';
+        file[1] = b'Z';
+        file.wr_u32(0x3C, 0x100);
+        file[0x100..0x104].copy_from_slice(b"PE\0\0");
+        file.wr_u16(0x104, 0x014C);
+        file.wr_u16(0x106, 1);
+        file.wr_u16(0x114, 0xE0);
+        file.wr_u16(0x118, 0x10B);
+        // Set EP somewhere away from the header so Attempt 1 fails
+        file.wr_u32(0x128, 0x5000);
+        file.wr_u32(0x138, 0x1000);
+        file.wr_u32(0x13C, 0x200);
+
+        let sections = 0x118 + 0xE0;
+        file[sections..sections + 8].copy_from_slice(b".bind\0\0\0");
+        file.wr_u32(sections + 8, bind_size);
+        file.wr_u32(sections + 12, bind_rva);
+        file.wr_u32(sections + 16, bind_size);
+        file.wr_u32(sections + 20, bind_raw);
+
+        file[bind_raw as usize..bind_raw as usize + bind_bytes.len()].copy_from_slice(&bind_bytes);
+
+        let mut pe = PeFile::from_bytes(file, std::path::PathBuf::from("dummy.exe")).unwrap();
+        let state = step1(&mut pe, Variant::V30, false).unwrap();
+        assert_eq!(state.header.signature, 0xC0DEC0DE);
+        assert_eq!(state.header.original_entry_point, 0x1234);
     }
 }

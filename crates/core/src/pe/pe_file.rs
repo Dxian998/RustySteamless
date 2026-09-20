@@ -280,6 +280,8 @@ pub struct PeFile {
     pub overlay: Option<Vec<u8>>,
     pub tls_directory: Option<TlsDirectory>,
     pub tls_callbacks: Vec<u64>,
+    pub removed_bind_rva: Option<u32>,
+    pub removed_bind_size: Option<u32>,
 }
 
 impl PeFile {
@@ -407,6 +409,8 @@ impl PeFile {
             overlay,
             tls_directory,
             tls_callbacks,
+            removed_bind_rva: None,
+            removed_bind_size: None,
         })
     }
 
@@ -525,6 +529,71 @@ impl PeFile {
         }
     }
 
+    // Scans `.rdata` section data for the original `IMAGE_IMPORT_DESCRIPTOR` table.
+    //
+    // When SteamStub wraps a file, it relocates `IMAGE_DIRECTORY_ENTRY_IMPORT` to point into
+    // the `.bind` section. Once `.bind` is removed, the import table directory must be restored
+    // to the original descriptor table in `.rdata`.
+    pub fn find_import_descriptor_in_rdata(&self) -> Option<u32> {
+        let rdata = self.get_section(".rdata")?;
+        if !rdata.is_valid() {
+            return None;
+        }
+        let rdata_data = self.get_section_data_by_name(".rdata")?;
+        let rdata_rva = rdata.virtual_address;
+        let rdata_len = rdata_data.len() as u32;
+
+        if rdata_data.len() < 20 {
+            return None;
+        }
+
+        for offset in (0..=rdata_data.len() - 20).step_by(4) {
+            let Some(name_rva) = rdata_data.rd_u32(offset + 12) else {
+                continue;
+            };
+            if name_rva < rdata_rva || name_rva >= rdata_rva.saturating_add(rdata_len) {
+                continue;
+            }
+
+            let name_off = (name_rva - rdata_rva) as usize;
+            if name_off >= rdata_data.len() {
+                continue;
+            }
+
+            let max_name_len = 64.min(rdata_data.len() - name_off);
+            let name_bytes = &rdata_data[name_off..name_off + max_name_len];
+            let name_end = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_bytes.len());
+            let name_slice = &name_bytes[..name_end];
+
+            if name_slice.len() < 4
+                || !name_slice[name_slice.len() - 4..].eq_ignore_ascii_case(b".dll")
+            {
+                continue;
+            }
+
+            let Some(orig_rva) = rdata_data.rd_u32(offset) else {
+                continue;
+            };
+            let Some(iat_rva) = rdata_data.rd_u32(offset + 16) else {
+                continue;
+            };
+
+            if orig_rva < rdata_rva || orig_rva >= rdata_rva.saturating_add(rdata_len) {
+                continue;
+            }
+            if iat_rva < rdata_rva || iat_rva >= rdata_rva.saturating_add(rdata_len) {
+                continue;
+            }
+
+            return Some(rdata_rva + offset as u32);
+        }
+
+        None
+    }
+
     /// Writes the unpacked image to `target`.
     ///
     /// Layout mirrors the C# unpackers: DOS header, DOS stub, patched NT
@@ -559,6 +628,37 @@ impl PeFile {
         out.wr_u32(nt_off + 24 + 16, params.address_of_entry_point);
         out.wr_u32(nt_off + 24 + 56, self.optional.size_of_image);
         out.wr_u32(nt_off + 24 + 64, params.checksum);
+
+        let pe32 = matches!(self.bits, ImageBits::Pe32);
+        let dir_base = nt_off + 24 + if pe32 { 96 } else { 112 };
+
+        // Fix the import table directory if it points into the removed .bind section..
+        let mut import_table = self.optional.directories[1];
+        if let (Some(bind_rva), Some(bind_size)) = (self.removed_bind_rva, self.removed_bind_size) {
+            if bind_size > 0
+                && import_table.virtual_address >= bind_rva
+                && import_table.virtual_address < bind_rva.saturating_add(bind_size)
+            {
+                if let Some(rdata_import_rva) = self.find_import_descriptor_in_rdata() {
+                    import_table.virtual_address = rdata_import_rva;
+                }
+            }
+        }
+        out.wr_u32(dir_base + 8, import_table.virtual_address);
+        out.wr_u32(dir_base + 8 + 4, import_table.size);
+
+        // Fix the certificate table directory entry if a certificate exists and .bind was removed..
+        let mut cert_table = self.optional.directories[4];
+        if self.removed_bind_rva.is_some() && cert_table.virtual_address > 0 && cert_table.size > 0
+        {
+            if let Some(last_section) = self.sections.last() {
+                let overlay_start =
+                    last_section.pointer_to_raw_data + last_section.size_of_raw_data;
+                cert_table.virtual_address = overlay_start;
+            }
+        }
+        out.wr_u32(dir_base + 4 * 8, cert_table.virtual_address);
+        out.wr_u32(dir_base + 4 * 8 + 4, cert_table.size);
 
         // Section headers.
         for (i, sec) in self.sections.iter().enumerate() {
@@ -752,5 +852,104 @@ mod tests {
         let data = vec![0x4d, 0x5a, 0x00, 0x00];
         let path = PathBuf::from("x");
         assert!(PeFile::from_bytes(data, path).is_err());
+    }
+
+    #[test]
+    fn find_import_descriptor_in_rdata_finds_valid_descriptor() {
+        let mut file = vec![0u8; 0x1000];
+        file[0] = b'M';
+        file[1] = b'Z';
+        file.wr_u32(0x3C, 0x100);
+        file[0x100..0x104].copy_from_slice(b"PE\0\0");
+        file.wr_u16(0x104, 0x014C);
+        file.wr_u16(0x106, 1);
+        file.wr_u16(0x114, 0xE0);
+        file.wr_u16(0x118, 0x10B);
+        file.wr_u32(0x138, 0x1000);
+        file.wr_u32(0x13C, 0x200);
+
+        let sections = 0x118 + 0xE0;
+        let rdata_rva = 0x2000u32;
+        let rdata_raw = 0x400u32;
+        let rdata_size = 0x400u32;
+        file[sections..sections + 8].copy_from_slice(b".rdata\0\0");
+        file.wr_u32(sections + 8, rdata_size);
+        file.wr_u32(sections + 12, rdata_rva);
+        file.wr_u32(sections + 16, rdata_size);
+        file.wr_u32(sections + 20, rdata_raw);
+
+        let desc_offset = (rdata_raw + 0x20) as usize;
+        file.wr_u32(desc_offset, rdata_rva + 0x100);
+        file.wr_u32(desc_offset + 12, rdata_rva + 0x80);
+        file.wr_u32(desc_offset + 16, rdata_rva + 0x100);
+
+        let dll_name_offset = (rdata_raw + 0x80) as usize;
+        file[dll_name_offset..dll_name_offset + 13].copy_from_slice(b"KERNEL32.dll\0");
+
+        let pe = PeFile::from_bytes(file, PathBuf::from("dummy.exe")).unwrap();
+        let found = pe.find_import_descriptor_in_rdata();
+        assert_eq!(found, Some(rdata_rva + 0x20));
+    }
+
+    #[test]
+    fn save_unpacked_fixes_import_table_and_certificate_table() {
+        let mut file = vec![0u8; 0x1000];
+        file[0] = b'M';
+        file[1] = b'Z';
+        file.wr_u32(0x3C, 0x100);
+        file[0x100..0x104].copy_from_slice(b"PE\0\0");
+        file.wr_u16(0x104, 0x014C);
+        file.wr_u16(0x106, 1);
+        file.wr_u16(0x114, 0xE0);
+        file.wr_u16(0x118, 0x10B);
+        file.wr_u32(0x138, 0x1000);
+        file.wr_u32(0x13C, 0x200);
+
+        let sections = 0x118 + 0xE0;
+        let rdata_rva = 0x2000u32;
+        let rdata_raw = 0x400u32;
+        let rdata_size = 0x400u32;
+        file[sections..sections + 8].copy_from_slice(b".rdata\0\0");
+        file.wr_u32(sections + 8, rdata_size);
+        file.wr_u32(sections + 12, rdata_rva);
+        file.wr_u32(sections + 16, rdata_size);
+        file.wr_u32(sections + 20, rdata_raw);
+
+        let desc_offset = (rdata_raw + 0x20) as usize;
+        file.wr_u32(desc_offset, rdata_rva + 0x100);
+        file.wr_u32(desc_offset + 12, rdata_rva + 0x80);
+        file.wr_u32(desc_offset + 16, rdata_rva + 0x100);
+        let dll_name_offset = (rdata_raw + 0x80) as usize;
+        file[dll_name_offset..dll_name_offset + 13].copy_from_slice(b"KERNEL32.dll\0");
+
+        // Directory entry 1: Import table at 0x180 (dir_base = 0x100 + 24 + 96 = 0x178, + 8)
+        file.wr_u32(0x180, 0x5000);
+        file.wr_u32(0x184, 0x40);
+
+        // Directory entry 4: Certificate table at 0x198 (0x178 + 32)
+        file.wr_u32(0x198, 0x1234);
+        file.wr_u32(0x19C, 0x200);
+
+        let mut pe = PeFile::from_bytes(file, PathBuf::from("dummy.exe")).unwrap();
+        pe.removed_bind_rva = Some(0x5000);
+        pe.removed_bind_size = Some(0x1000);
+
+        let temp_dir = std::env::temp_dir();
+        let target = temp_dir.join("test_save_unpacked.exe");
+        let params = SaveParameters {
+            dos_stub: None,
+            address_of_entry_point: 0x1000,
+            checksum: 0,
+            code_section: None,
+        };
+        pe.save_unpacked(&target, &params).unwrap();
+        let saved_bytes = std::fs::read(&target).unwrap();
+        let _ = std::fs::remove_file(&target);
+
+        let saved_import_rva = saved_bytes.rd_u32(0x180).unwrap();
+        assert_eq!(saved_import_rva, rdata_rva + 0x20);
+
+        let saved_cert_va = saved_bytes.rd_u32(0x198).unwrap();
+        assert_eq!(saved_cert_va, 0x800);
     }
 }
