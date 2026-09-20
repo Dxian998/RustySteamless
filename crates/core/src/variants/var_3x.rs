@@ -111,15 +111,15 @@ fn parse_header(data: &[u8], variant: Variant) -> Result<Var3xHeader> {
             code_section_virtual_address: rd_u32(data, 64)? as u64,
             code_section_raw_size: rd_u32(data, 68)? as u64,
             aes_key: read_array(data, 72)?,
-            aes_iv: read_array(data, 120)?,
-            code_section_stolen_data: read_array(data, 136)?,
+            aes_iv: read_array(data, 104)?,
+            code_section_stolen_data: read_array(data, 120)?,
             encryption_keys: [
-                rd_u32(data, 152)?,
-                rd_u32(data, 156)?,
-                rd_u32(data, 160)?,
-                rd_u32(data, 164)?,
+                rd_u32(data, 136)?,
+                rd_u32(data, 140)?,
+                rd_u32(data, 144)?,
+                rd_u32(data, 148)?,
             ],
-            has_tls_callback: rd_u32(data, 168)?,
+            has_tls_callback: rd_u32(data, 152)?,
         },
         Variant::V31 => Var3xHeader {
             xor_key: rd_u32(data, 0)?,
@@ -133,13 +133,13 @@ fn parse_header(data: &[u8], variant: Variant) -> Result<Var3xHeader> {
             code_section_virtual_address: rd_u64(data, 72)?,
             code_section_raw_size: rd_u64(data, 80)?,
             aes_key: read_array(data, 88)?,
-            aes_iv: read_array(data, 168)?,
-            code_section_stolen_data: read_array(data, 184)?,
+            aes_iv: read_array(data, 120)?,
+            code_section_stolen_data: read_array(data, 136)?,
             encryption_keys: [
-                rd_u32(data, 200)?,
-                rd_u32(data, 204)?,
-                rd_u32(data, 208)?,
-                rd_u32(data, 212)?,
+                rd_u32(data, 152)?,
+                rd_u32(data, 156)?,
+                rd_u32(data, 160)?,
+                rd_u32(data, 164)?,
             ],
             has_tls_callback: 0,
         },
@@ -673,9 +673,10 @@ mod tests {
         h[52..56].copy_from_slice(&0u32.to_le_bytes()); // flags
         h[64..68].copy_from_slice(&0x1000u32.to_le_bytes()); // code section va
         h[72..104].fill(0x01); // aes key
-        h[120..136].fill(0x02); // aes iv
-        h[136..152].fill(0x03); // stolen
-        h[152..168].fill(0x04); // encryption keys
+        h[104..120].fill(0x02); // aes iv
+        h[120..136].fill(0x03); // stolen
+        h[136..152].fill(0x04); // encryption keys
+        h[152..156].copy_from_slice(&1u32.to_le_bytes()); // has_tls_callback
         h
     }
 
@@ -686,7 +687,35 @@ mod tests {
         assert_eq!(h.code_section_virtual_address, 0x1000);
         assert_eq!(h.original_entry_point, 0x1234);
         assert_eq!(h.aes_key, [0x01; 32]);
+        assert_eq!(h.aes_iv, [0x02; 16]);
+        assert_eq!(h.code_section_stolen_data, [0x03; 16]);
         assert_eq!(h.encryption_keys, [0x0404_0404; 4]);
+        assert_eq!(h.has_tls_callback, 1);
+    }
+
+    #[test]
+    fn parses_v31_header() {
+        let mut h_bytes = vec![0u8; 0xF0];
+        h_bytes[0..4].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        h_bytes[4..8].copy_from_slice(&0xC0DEC0DFu32.to_le_bytes());
+        h_bytes[24..28].copy_from_slice(&0x2000u32.to_le_bytes());
+        h_bytes[32..36].copy_from_slice(&0x5678u32.to_le_bytes());
+        h_bytes[72..80].copy_from_slice(&0x1000u64.to_le_bytes());
+        h_bytes[80..88].copy_from_slice(&0x4000u64.to_le_bytes());
+        h_bytes[88..120].fill(0xAA); // aes_key
+        h_bytes[120..136].fill(0xBB); // aes_iv
+        h_bytes[136..152].fill(0xCC); // code_section_stolen_data
+        h_bytes[152..168].fill(0xDD); // encryption_keys
+
+        let h = parse_header(&h_bytes, Variant::V31).unwrap();
+        assert_eq!(h.signature, 0xC0DEC0DF);
+        assert_eq!(h.original_entry_point, 0x5678);
+        assert_eq!(h.code_section_virtual_address, 0x1000);
+        assert_eq!(h.code_section_raw_size, 0x4000);
+        assert_eq!(h.aes_key, [0xAA; 32]);
+        assert_eq!(h.aes_iv, [0xBB; 16]);
+        assert_eq!(h.code_section_stolen_data, [0xCC; 16]);
+        assert_eq!(h.encryption_keys, [0xDDDD_DDDD; 4]);
     }
 
     #[test]
