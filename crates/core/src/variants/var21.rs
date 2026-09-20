@@ -132,17 +132,17 @@ impl Variant21 {
             Header {
                 payload_va: header_data.rd_u32(32).ok_or(Error::OutOfBounds)?,
                 payload_size: header_data.rd_u32(36).ok_or(Error::OutOfBounds)?,
-                drmp_va_off: 56,
-                drmp_size_off: 60,
-                xtea_keys_off: 64,
+                drmp_va_off: header_data.rd_u32(56).ok_or(Error::OutOfBounds)? as usize,
+                drmp_size_off: header_data.rd_u32(60).ok_or(Error::OutOfBounds)? as usize,
+                xtea_keys_off: header_data.rd_u32(64).ok_or(Error::OutOfBounds)? as usize,
             }
         } else {
             Header {
                 payload_va: header_data.rd_u32(36).ok_or(Error::OutOfBounds)?,
                 payload_size: header_data.rd_u32(40).ok_or(Error::OutOfBounds)?,
-                drmp_va_off: 60,
-                drmp_size_off: 64,
-                xtea_keys_off: 68,
+                drmp_va_off: header_data.rd_u32(60).ok_or(Error::OutOfBounds)? as usize,
+                drmp_size_off: header_data.rd_u32(64).ok_or(Error::OutOfBounds)? as usize,
+                xtea_keys_off: header_data.rd_u32(68).ok_or(Error::OutOfBounds)? as usize,
             }
         };
 
@@ -407,7 +407,7 @@ impl Variant21 {
                 aes.decrypt(&merged, AesMode::Cbc)
             };
 
-        // Merge the code section data..
+        // Merge the code section data
         let section_data_len = pe.section_data[code_index].len();
         let copy_len = code_section_data.len().min(section_data_len);
         let mut merged_section = pe.section_data[code_index].clone();

@@ -142,7 +142,7 @@ pub struct DataDirectory {
 }
 
 /// IMAGE_SECTION_HEADER
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SectionHeader {
     pub name: [u8; 8],
     pub virtual_size: u32,
@@ -471,7 +471,7 @@ impl PeFile {
 
     /// Returns the index of the given section.
     pub fn section_index_of(&self, section: &SectionHeader) -> Option<usize> {
-        self.sections.iter().position(|s| std::ptr::eq(s, section))
+        self.sections.iter().position(|s| s == section)
     }
 
     /// Removes a section by index.
